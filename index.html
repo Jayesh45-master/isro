@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Earth & Sentinel Satellites Simulator</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="./style.css?v=1.0.2">
+    <script>
+        // --- CORS CREDENTIALS BYPASS FOR HUGGING FACE SPACES ---
+        // Overrides Request prototype, window.Request constructor, window.fetch, 
+        // and window.EventSource to force credentials mode to "same-origin" / disabled 
+        // for Hugging Face endpoints. This prevents CORS preflight blocks.
+        
+        // 1. Intercept Request prototype credentials getter
+        try {
+            const originalCredentialsGetter = Object.getOwnPropertyDescriptor(Request.prototype, 'credentials').get;
+            Object.defineProperty(Request.prototype, 'credentials', {
+                get() {
+                    const url = this.url || "";
+                    if (url.includes("hf.space") || url.includes("huggingface.co")) {
+                        return "same-origin";
+                    }
+                    return originalCredentialsGetter.call(this);
+                },
+                configurable: true
+            });
+        } catch (e) {
+            console.error("Failed to override Request.prototype.credentials:", e);
+        }
+
+        // 2. Intercept window.Request constructor
+        const originalRequest = window.Request;
+        window.Request = function (input, init) {
+            if (typeof input === "string") {
+                if (input.includes("hf.space") || input.includes("huggingface.co")) {
+                    if (init && init.credentials === "include") {
+                        init = { ...init, credentials: "same-origin" };
+                    }
+                }
+            } else if (input instanceof originalRequest) {
+                const url = input.url || "";
+                if (url.includes("hf.space") || url.includes("huggingface.co")) {
+                    if (input.credentials === "include") {
+                        try {
+                            init = init || {};
+                            init.credentials = "same-origin";
+                        } catch (e) {}
+                    }
+                }
+            }
+            return new originalRequest(input, init);
+        };
+        window.Request.prototype = originalRequest.prototype;
+
+        // 3. Intercept window.fetch
+        const originalFetch = window.fetch;
+        window.fetch = function (input, init) {
+            if (init && init.credentials === "include" && typeof input === "string") {
+                if (input.includes("hf.space") || input.includes("huggingface.co")) {
+                    init.credentials = "same-origin";
+                }
+            } else if (input instanceof Request) {
+                const url = input.url || "";
+                if (url.includes("hf.space") || url.includes("huggingface.co")) {
+                    if (input.credentials === "include") {
+                        try {
+                            input = new Request(input, { credentials: "same-origin" });
+                        } catch (e) {}
+                    }
+                }
+            }
+            return originalFetch.call(this, input, init);
+        };
+
+        // 4. Intercept window.EventSource
+        const originalEventSource = window.EventSource;
+        window.EventSource = function (url, init) {
+            if (url && (url.includes("hf.space") || url.includes("huggingface.co"))) {
+                if (init && init.withCredentials) {
+                    init = { ...init, withCredentials: false };
+                }
+            }
+            return new originalEventSource(url, init);
+        };
+        window.EventSource.prototype = originalEventSource.prototype;
+
+        window.addEventListener('error', function(e) {
+            const status = document.getElementById('loading-status');
+            if (status) {
+                status.style.color = '#f43f5e';
+                status.innerHTML = 'ERROR: ' + e.message + '<br><small style="color:#64748b;">at ' + (e.filename ? e.filename.split('/').pop() : 'unknown') + ':' + e.lineno + '</small>';
+            }
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+            const status = document.getElementById('loading-status');
+            if (status) {
+                status.style.color = '#f43f5e';
+                status.innerHTML = 'PROMISE ERROR: ' + e.reason;
+            }
+        });
+    </script>
+    <!-- Google Fonts for premium typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <!-- FontAwesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+
+    <!-- Import map for Three.js modules -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./libs/three.module.js",
+          "three/addons/": "./libs/addons/"
+        }
+      }
+    </script>
+</head>
+<body>
+    <!-- 3D Canvas -->
+    <canvas id="globe-canvas"></canvas>
+
+    <!-- Fullscreen Satellite HUD Map -->
+    <div id="hud-map" class="hidden"></div>
+
+    <!-- Satellite HUD View Overlay (Hidden by default, placed at top of body for robust sibling styling) -->
+    <div id="satellite-hud" class="hidden">
+        <div class="hud-reticle">
+            <div class="reticle-center"></div>
+        </div>
+        
+        <div class="hud-panel left glass-card">
+            <div class="hud-header"><i class="fa-solid fa-satellite"></i> LIVE SATELLITE FEED</div>
+            <div class="hud-row"><span class="label">TARGET CITY:</span> <span class="val" id="hud-target-name">None</span></div>
+            <div class="hud-row"><span class="label">COORDINATES:</span> <span class="val" id="hud-target-coords">0.0000°, 0.0000°</span></div>
+            <div class="hud-row"><span class="label">SCAN RATE:</span> <span class="val">60 FPS (REALTIME)</span></div>
+            <div class="hud-row"><span class="label">LIGHTNING:</span> <span class="val" id="hud-illumination">DAY</span></div>
+            <div class="hud-row"><span class="label">FEED STATUS:</span> <span class="val" style="color: #10b981; font-weight: 800; text-shadow: 0 0 8px rgba(16,185,129,0.3);">ONLINE</span></div>
+
+            <!-- Cloud Reconstruction Prompt Box (Distinct Card) -->
+            <div class="hud-reconstruct-box" style="margin-top: 14px; background: rgba(12, 12, 24, 0.55); border: 1px solid rgba(244, 63, 94, 0.2); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.35);">
+                <div style="font-size: 0.75rem; color: #f43f5e; font-weight: 700; letter-spacing: 0.5px; display: flex; align-items: center; gap: 6px;">
+                    <i class="fa-solid fa-cloud"></i> LISS-IV CLOUD RECONSTRUCTION
+                </div>
+                <p style="font-size: 0.72rem; color: #94a3b8; line-height: 1.4;">
+                    Persistent cloud cover detected. Upload a cloudy LISS-IV satellite scene to reconstruct the surface using Generative AI.
+                </p>
+                <input type="file" id="cloudy-upload" accept=".png,.jpg,.jpeg,.tif,.tiff,image/png,image/jpeg,image/tiff" style="display: none;">
+                <button id="btn-upload-cloudy" class="ctrl-btn" style="border-color: rgba(244, 63, 94, 0.4); color: #f43f5e; font-size: 0.8rem; padding: 10px 14px; justify-content: center; width: 100%; gap: 8px; margin-top: 4px;">
+                    <i class="fa-solid fa-cloud-arrow-up"></i> Upload Cloudy LISS-IV Image
+                </button>
+                <div id="upload-status" class="hidden" style="margin-top: 4px; font-size: 0.72rem; font-family: 'Share Tech Mono', monospace; line-height: 1.4; color: #60a5fa;">
+                    <i class="fa-solid fa-spinner fa-spin"></i> <span id="upload-status-text">Processing LISS-IV scene...</span>
+                </div>
+                <!-- Inline Notification Box (Shifted from floating toast) -->
+                <div id="hud-notification" class="hidden" style="margin-top: 8px; padding: 10px 12px; border-left: 3px solid #f43f5e; background: rgba(244, 63, 94, 0.08); border-radius: 6px; font-size: 0.72rem; line-height: 1.4;"></div>
+            </div>
+
+            <button id="btn-exit-hud" class="ctrl-btn secondary-btn" style="margin-top: 14px; width: 100%; justify-content: center;">
+                <i class="fa-solid fa-circle-xmark"></i> Return to Orbit
+            </button>
+        </div>
+
+        <!-- Test LISS-IV Samples Panel (Bottom Left Corner) -->
+        <div class="hud-panel left-lower glass-card" style="position: absolute; bottom: 24px; left: 24px; width: 320px; padding: 20px; pointer-events: auto; display: flex; flex-direction: column; gap: 12px; z-index: 60; box-shadow: 0 8px 32px 0 rgba(0,0,0,0.5);">
+            <div class="hud-header"><i class="fa-solid fa-images"></i> TEST SAMPLE LISS 4</div>
+            <p style="font-size: 0.72rem; color: #94a3b8; line-height: 1.4; margin-bottom: 4px;">
+                Select a sample below to lock target for reconstruction, or click "Download" to save the raw cloudy scene.
+            </p>
+            <div class="samples-list" style="max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 4px;">
+                <!-- Row 1 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="1" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_1.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 1">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #1</span>
+                    </div>
+                    <a href="./assets/test_liss4_1.png" download="test_liss4_1.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+                <!-- Row 2 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="2" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_2.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 2">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #2</span>
+                    </div>
+                    <a href="./assets/test_liss4_2.png" download="test_liss4_2.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+                <!-- Row 3 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="3" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_3.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 3">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #3</span>
+                    </div>
+                    <a href="./assets/test_liss4_3.png" download="test_liss4_3.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+                <!-- Row 4 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="4" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_4.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 4">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #4</span>
+                    </div>
+                    <a href="./assets/test_liss4_4.png" download="test_liss4_4.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+                <!-- Row 5 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="5" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_5.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 5">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #5</span>
+                    </div>
+                    <a href="./assets/test_liss4_5.png" download="test_liss4_5.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+                <!-- Row 6 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="6" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_6.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 6">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #6</span>
+                    </div>
+                    <a href="./assets/test_liss4_6.png" download="test_liss4_6.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+                <!-- Row 7 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="7" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_7.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 7">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #7</span>
+                    </div>
+                    <a href="./assets/test_liss4_7.png" download="test_liss4_7.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+                <!-- Row 8 -->
+                <div class="sample-row" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: none;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="sample-img-container" data-sample="8" onmouseover="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.4)';" onmouseout="if(this.style.borderColor !== 'rgb(244, 63, 94)') this.style.borderColor = 'rgba(255,255,255,0.15)';" style="cursor: pointer; width: 36px; height: 36px; border-radius: 4px; overflow: hidden; border: 2px solid rgba(255,255,255,0.15); transition: all 0.2s; box-sizing: border-box;">
+                            <img src="./assets/test_liss4_8.png" style="width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none;" alt="Sample 8">
+                        </div>
+                        <span style="font-size: 0.72rem; color: #cbd5e1; font-weight: 500;">Sample #8</span>
+                    </div>
+                    <a href="./assets/test_liss4_8.png" download="test_liss4_8.png" class="ctrl-btn download-link-btn" style="width: auto; padding: 4px 8px; font-size: 0.65rem; border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; display: flex; align-items: center; gap: 4px; margin: 0; pointer-events: auto;">
+                        <i class="fa-solid fa-download"></i> Download
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="hud-scanlines"></div>
+    </div>
+
+    <!-- Loading Screen -->
+    <div id="loading-screen">
+        <div class="loader-content">
+            <div class="radar-spinner">
+                <div class="sweep"></div>
+                <div class="circle outer"></div>
+                <div class="circle middle"></div>
+                <div class="circle inner"></div>
+            </div>
+            <h1>ORBITAL INITIATION</h1>
+            <p id="loading-status">Establishing orbital connection...</p>
+            <div class="loading-bar-container">
+                <div class="loading-bar" id="loading-progress"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- UI Overlay Panels -->
+
+    <!-- Top Left Search Panel -->
+    <div class="panel-top-left">
+        <div class="search-container">
+            <i class="fa-solid fa-magnifying-glass search-icon"></i>
+            <input type="text" id="country-search" placeholder="Search Cities..." autocomplete="off">
+            <div id="search-results" class="search-dropdown hidden"></div>
+        </div>
+    </div>
+
+    <!-- Top Right Controls (Telemetry Panel placed below Bizarre Mode button) -->
+    <div class="panel-top-right">
+        <button id="btn-bizarre" class="ctrl-btn">
+            <i class="fa-solid fa-wand-magic-sparkles"></i>
+            <span>Bizarre Mode</span>
+        </button>
+
+        <!-- Live Telemetry Panel -->
+        <div class="panel-telemetry-right glass-card">
+            <div class="panel-header">
+                <i class="fa-solid fa-satellite-dish pulse-icon"></i>
+                <h2>LIVE SATELLITE TELEMETRY</h2>
+            </div>
+            
+            <div class="sat-telemetry-container">
+                <!-- Sentinel 1 -->
+                <div class="sat-card" id="sat1-card">
+                    <div class="sat-card-header">
+                        <span class="sat-name">SENTINEL-1</span>
+                        <span class="sat-status status-active">ACTIVE (SAR)</span>
+                    </div>
+                    <div class="telemetry-grid">
+                        <div class="telemetry-item">
+                            <span class="label">LAT</span>
+                            <span class="val" id="sat1-lat">0.0000°</span>
+                        </div>
+                        <div class="telemetry-item">
+                            <span class="label">LON</span>
+                            <span class="val" id="sat1-lon">0.0000°</span>
+                        </div>
+                        <div class="telemetry-item">
+                            <span class="label">ALTITUDE</span>
+                            <span class="val" id="sat1-alt">693 km</span>
+                        </div>
+                        <div class="telemetry-item">
+                            <span class="label">VELOCITY</span>
+                            <span class="val" id="sat1-vel">7.51 km/s</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sentinel 2 -->
+                <div class="sat-card" id="sat2-card">
+                    <div class="sat-card-header">
+                        <span class="sat-name">SENTINEL-2</span>
+                        <span class="sat-status status-active">ACTIVE (MSI)</span>
+                    </div>
+                    <div class="telemetry-grid">
+                        <div class="telemetry-item">
+                            <span class="label">LAT</span>
+                            <span class="val" id="sat2-lat">0.0000°</span>
+                        </div>
+                        <div class="telemetry-item">
+                            <span class="label">LON</span>
+                            <span class="val" id="sat2-lon">0.0000°</span>
+                        </div>
+                        <div class="telemetry-item">
+                            <span class="label">ALTITUDE</span>
+                            <span class="val" id="sat2-alt">786 km</span>
+                        </div>
+                        <div class="telemetry-item">
+                            <span class="label">VELOCITY</span>
+                            <span class="val" id="sat2-vel">7.46 km/s</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Simulation Tuning Controls -->
+            <div class="sim-controls">
+                <div class="control-row">
+                    <label for="slider-orbit-speed">Orbit Speed</label>
+                    <input type="range" id="slider-orbit-speed" min="0" max="5" step="0.1" value="1">
+                    <span class="control-val" id="val-orbit-speed">1.0x</span>
+                </div>
+                <div class="control-row">
+                    <label for="slider-earth-speed">Earth Spin</label>
+                    <input type="range" id="slider-earth-speed" min="0" max="5" step="0.1" value="0">
+                    <span class="control-val" id="val-earth-speed">LIVE</span>
+                </div>
+                <div class="checkbox-grid">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="chk-orbits" checked>
+                        <span class="checkmark"></span> Show Orbits
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="chk-clouds" checked>
+                        <span class="checkmark"></span> Show Clouds
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Right Controls (Matching User Screenshot Layout) -->
+    <div class="panel-bottom-right">
+        <!-- Cosmic Velocities Card -->
+        <div class="glass-card" style="padding: 16px; width: 100%; display: flex; flex-direction: column; gap: 10px; border-color: rgba(52, 211, 153, 0.25);">
+            <div style="font-size: 0.8rem; font-weight: 800; color: #34d399; letter-spacing: 1px; display: flex; align-items: center; gap: 8px;">
+                <i class="fa-solid fa-gauge-high"></i> COSMIC VELOCITIES
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; flex-direction: column;">
+                    <span style="font-size: 0.65rem; color: #64748b; font-weight: 600; letter-spacing: 0.5px;">EARTH ROTATION (EQUATOR)</span>
+                    <span style="font-family: 'Share Tech Mono', monospace; font-size: 0.85rem; color: #e2e8f0;">1,674 km/h <small style="color: #64748b; font-size: 0.7rem;">(1,040 mph)</small></span>
+                </div>
+                <div style="display: flex; flex-direction: column; margin-top: 2px;">
+                    <span style="font-size: 0.65rem; color: #64748b; font-weight: 600; letter-spacing: 0.5px;">EARTH ORBITAL SPEED</span>
+                    <span style="font-family: 'Share Tech Mono', monospace; font-size: 0.85rem; color: #e2e8f0;">107,225.3 km/h <small style="color: #64748b; font-size: 0.7rem;">(66,500 mph)</small></span>
+                </div>
+                <div style="display: flex; flex-direction: column; margin-top: 2px;">
+                    <span style="font-size: 0.65rem; color: #64748b; font-weight: 600; letter-spacing: 0.5px;">SOLAR SYSTEM DRIFT</span>
+                    <span style="font-family: 'Share Tech Mono', monospace; font-size: 0.85rem; color: #e2e8f0;">828,000 km/h <small style="color: #64748b; font-size: 0.7rem;">(550,000 mph)</small></span>
+                </div>
+            </div>
+        </div>
+
+        <button id="btn-info" class="ctrl-btn secondary-btn">
+            <i class="fa-solid fa-circle-info"></i>
+            <span>More Info</span>
+        </button>
+        <button id="btn-fullscreen" class="ctrl-btn secondary-btn">
+            <i class="fa-solid fa-expand"></i>
+            <span>Fullscreen</span>
+        </button>
+    </div>
+
+    <!-- More Info Modal -->
+    <div id="info-modal" class="modal-overlay hidden">
+        <div class="modal-content glass-card">
+            <button id="modal-close" class="close-btn">&times;</button>
+            <h2>COPERNICUS SENTINEL CONSTELLATIONS</h2>
+            <div class="modal-grid">
+                <!-- Sentinel-1 Column -->
+                <div class="modal-col">
+                    <div class="col-header">
+                        <i class="fa-solid fa-radar"></i>
+                        <h3>SENTINEL-1 MISSION</h3>
+                    </div>
+                    <p class="mission-desc">Sentinel-1 is a polar-orbiting, all-weather, day-and-night radar imaging mission for land and ocean services.</p>
+                    <table class="info-table">
+                        <tr>
+                            <td><strong>Instrument</strong></td>
+                            <td>C-SAR (Synthetic Aperture Radar)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Orbit Alt</strong></td>
+                            <td>~693 km (Sun-Synchronous)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Inclination</strong></td>
+                            <td>98.18°</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Key Applications</strong></td>
+                            <td>Sea ice mapping, land deformation tracking, oil spill monitoring, flood hazard analysis.</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <!-- Sentinel-2 Column -->
+                <div class="modal-col">
+                    <div class="col-header">
+                        <i class="fa-solid fa-camera"></i>
+                        <h3>SENTINEL-2 MISSION</h3>
+                    </div>
+                    <p class="mission-desc">Sentinel-2 is a polar-orbiting, multispectral high-resolution imaging mission for land monitoring.</p>
+                    <table class="info-table">
+                        <tr>
+                            <td><strong>Instrument</strong></td>
+                            <td>MSI (Multi-Spectral Instrument)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Orbit Alt</strong></td>
+                            <td>~786 km (Sun-Synchronous)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Inclination</strong></td>
+                            <td>98.57°</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Key Applications</strong></td>
+                            <td>Agriculture monitoring, forest management, land-use change, water bodies inspection.</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <p>Copernicus is the Earth observation component of the European Union's Space programme.</p>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="./main.js?v=1.0.2"></script>
+</body>
+</html>

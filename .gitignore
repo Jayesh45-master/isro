@@ -1,0 +1,6 @@
+node_modules/
+dist/
+rice1_best.pth
+bah-2026-cloud-removal/
+.DS_Store
+*.log
